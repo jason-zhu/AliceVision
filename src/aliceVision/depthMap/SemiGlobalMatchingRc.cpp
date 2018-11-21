@@ -567,9 +567,34 @@ bool SemiGlobalMatchingRc::sgmrc(bool checkIfExists)
     const int volDimX = w;
     const int volDimY = h;
     const int volDimZ = depths->size();
-    float volumeMBinGPUMem = 0.0f;
 
-    StaticVector<unsigned char>* simVolume = nullptr;
+    sp->cps.cameraToDevice( rc, tcams );
+
+// #define FORCE_ZDIM_LIMIT 32
+#undef  FORCE_ZDIM_LIMIT
+#ifndef FORCE_ZDIM_LIMIT
+    const long gpu_bytes_reqd_per_plane = volDimX * volDimY * sizeof(float) * 2; // safety margin 100%
+    const long gpu_bytes_free = sp->cps.getDeviceMemoryInfo().x * 1024 * 1024;
+    int        zDimsAtATime = depths->size();
+    const int  camsAtATime  = tcams.size();
+    if( gpu_bytes_reqd_per_plane * zDimsAtATime * camsAtATime > gpu_bytes_free )
+    {
+        while( zDimsAtATime > 1 && gpu_bytes_reqd_per_plane * zDimsAtATime * camsAtATime > gpu_bytes_free )
+        {
+            zDimsAtATime /= 2;
+        }
+    }
+    if(sp->mp->verbose)
+        ALICEVISION_LOG_DEBUG("bytes free on GPU: " << gpu_bytes_free
+                           << "(" << (int)(gpu_bytes_free/1024.0f/1024.0f) << " MB)"<< std::endl
+                           << "    estimated req'd bytes/plane: " << gpu_bytes_reqd_per_plane << std::endl
+                           << "    estimated dims at a time: " << zDimsAtATime << std::endl
+                           << "    cams at a time: " << camsAtATime << std::endl
+                           << "    estimated total: " << gpu_bytes_reqd_per_plane * zDimsAtATime * camsAtATime
+                           << " (" << (int)(gpu_bytes_reqd_per_plane * zDimsAtATime * camsAtATime/1024.0f/1024.0f) << " MB)" );
+#else
+    int zDimsAtATime = FORCE_ZDIM_LIMIT; // for example FORCE_ZDIM_LIMIT=32
+#endif
 
     StaticVectorBool* rcSilhoueteMap = nullptr;
     if(sp->useSilhouetteMaskCodedByColor)
@@ -580,46 +605,65 @@ bool SemiGlobalMatchingRc::sgmrc(bool checkIfExists)
         sp->cps.getSilhoueteMap(rcSilhoueteMap, scale, step, sp->silhouetteMaskColor, rc);
     }
 
+    std::cerr << "In " << __FUNCTION__ << std::endl
+              << "    rc camera " << rc << " has depth " << depths->size() << std::endl;
+    std::vector<std::vector<float> > subDepths( tcams.size() );
+    for( int c = 0; c < tcams.size(); c++ )
     {
-        std::vector<float> subDepths;
-        getSubDepthsForTCam(0, subDepths);
-        SemiGlobalMatchingRcTc srt(subDepths, rc, tcams[0], scale, step, sp, rcSilhoueteMap);
-        simVolume = srt.computeDepthSimMapVolume(volumeMBinGPUMem, wsh, gammaC, gammaP);
+        getSubDepthsForTCam( c, subDepths[c] );
+        std::cerr << "    tc camera " << tcams[c] << " uses " << subDepths[c].size() << " depths" << std::endl;
     }
 
-    // recompute to all depths
-    volumeMBinGPUMem = ((volumeMBinGPUMem / (float)depthsTcamsLimits[0].y) * (float)volDimZ);
+    std::vector<StaticVector<unsigned char> > simVolume;
+    simVolume.resize( tcams.size() );
 
-    SemiGlobalMatchingVolume* svol = new SemiGlobalMatchingVolume(volumeMBinGPUMem, volDimX, volDimY, volDimZ, sp);
-    svol->copyVolume(simVolume, depthsTcamsLimits[0].x, depthsTcamsLimits[0].y);
-    delete simVolume;
+    /* request this device to allocate
+     *   (max_img - 1) * X * Y * dims_at_a_time * sizeof(float)
+     * of device memory.
+     */
+    int devid;
+    cudaGetDevice( &devid );
+    printf("Allocating %d times %d %d %d on device %d\n", tcams.size(),
+                                             volDimX,
+                                             volDimY,
+                                             zDimsAtATime, devid );
+    std::vector<CudaDeviceMemoryPitched<float, 3>*> volume_tmp_on_gpu;
+    sp->cps.allocTempVolume( volume_tmp_on_gpu,
+                             tcams.size(),
+                             volDimX,
+                             volDimY,
+                             zDimsAtATime );
 
-    for(int c = 1; c < tcams.size(); c++)
+    std::vector<int> index_set( tcams.size() );
+    for(int c = 0; c < tcams.size(); c++)
     {
-        std::vector<float> subDepths;
-        getSubDepthsForTCam(c, subDepths);
-        SemiGlobalMatchingRcTc* srt = new SemiGlobalMatchingRcTc(subDepths, rc, tcams[c], scale, step, sp, rcSilhoueteMap);
-        simVolume = srt->computeDepthSimMapVolume(volumeMBinGPUMem, wsh, gammaC, gammaP);
-        delete srt;
-        svol->addVolumeSecondMin(simVolume,depthsTcamsLimits[c].x,depthsTcamsLimits[c].y);
-        delete simVolume;
+        index_set[c] = c;
     }
+    SemiGlobalMatchingRcTc srt( index_set, subDepths, rc, tcams, scale, step, zDimsAtATime, sp, rcSilhoueteMap );
+    srt.computeDepthSimMapVolume( simVolume, volume_tmp_on_gpu, wsh, gammaC, gammaP );
+
+    sp->cps.freeTempVolume( volume_tmp_on_gpu );
+
+    index_set.erase( index_set.begin() );
+    SemiGlobalMatchingVolume svol( volDimX, volDimY, volDimZ, zDimsAtATime, sp );
+    svol.copyVolume( simVolume[0], depthsTcamsLimits[0].x, depthsTcamsLimits[0].y);
+    svol.addVolumeSecondMin( index_set, simVolume, depthsTcamsLimits );
 
     // Reduction of 'volume' (X, Y, Z) into 'volumeStepZ' (X, Y, Z/step)
-    svol->cloneVolumeSecondStepZ();
+    svol.cloneVolumeSecondStepZ();
 
     // Filter on the 3D volume to weight voxels based on their neighborhood strongness.
     // So it downweights local minimums that are not supported by their neighborhood.
     if(sp->doSGMoptimizeVolume) // this is here for experimental reason ... to show how SGGC work on non
                                 // optimized depthmaps ... it must equals to true in normal case
     {
-        svol->SGMoptimizeVolumeStepZ(rc, step, 0, 0, scale);
+        svol.SGMoptimizeVolumeStepZ(rc, step, scale);
     }
 
     // For each pixel: choose the voxel with the minimal similarity value
     int zborder = 2;
-    StaticVector<IdValue>* volumeBestIdVal = svol->getOrigVolumeBestIdValFromVolumeStepZ(zborder);
-    delete svol;
+    StaticVector<IdValue>* volumeBestIdVal = svol.getOrigVolumeBestIdValFromVolumeStepZ(zborder);
+    svol.freeMem();
 
     if(rcSilhoueteMap != nullptr)
     {
@@ -632,6 +676,7 @@ bool SemiGlobalMatchingRc::sgmrc(bool checkIfExists)
             }
         }
         delete rcSilhoueteMap;
+        rcSilhoueteMap = nullptr;
     }
 
     /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -735,7 +780,7 @@ void computeDepthMapsPSSGM(mvsUtils::MultiViewParams* mp, mvsUtils::PreMatchCams
     ALICEVISION_LOG_INFO("Number of GPU devices: " << num_gpus << ", number of CPU threads: " << num_cpu_threads);
     int numthreads = std::min(num_gpus, num_cpu_threads);
 
-    int num_gpus_to_use = mp->_ini.get<int>("semiGlobalMatching.num_gpus_to_use", 0);
+    int num_gpus_to_use = std::min( num_gpus, mp->_ini.get<int>("semiGlobalMatching.num_gpus_to_use", 1) );
     if(num_gpus_to_use > 0)
     {
         numthreads = num_gpus_to_use;
@@ -755,6 +800,14 @@ void computeDepthMapsPSSGM(mvsUtils::MultiViewParams* mp, mvsUtils::PreMatchCams
             int cpu_thread_id = omp_get_thread_num();
             int CUDADeviceNo = cpu_thread_id % numthreads;
             ALICEVISION_LOG_INFO("CPU thread " << cpu_thread_id << " (of " << numthreads << ") uses CUDA device: " << CUDADeviceNo);
+            cudaError_t err = cudaSetDevice( CUDADeviceNo );
+            if( err != cudaSuccess )
+            {
+                ALICEVISION_LOG_ERROR( "Failed to set up CUDA device " << CUDADeviceNo << " for thread " << cpu_thread_id );
+                throw std::runtime_error( "Failed to set up CUDA device for thread" );
+                    ALICEVISION_LOG_ERROR( "Failed to set up CUDA device " << CUDADeviceNo << " for thread " << cpu_thread_id );
+                    throw std::runtime_error( "Failed to set up CUDA device for thread" );
+            }
 
             int rcFrom = CUDADeviceNo * (cams.size() / numthreads);
             int rcTo = (CUDADeviceNo + 1) * (cams.size() / numthreads);
